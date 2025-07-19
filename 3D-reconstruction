@@ -1,0 +1,394 @@
+# volume_reconstruction_tlstm.py
+"""3‑D Tumor Reconstruction with TLSTM + Spatial Attention + Adversarial Loss
+
+Stage‑3 of the pipeline: given a *sequence* of 2‑D CT slices with detected
+lung‑tumor RoIs (output of Stage‑2), reconstruct a volumetric (D×H×W)
+representation of the tumor region.
+
+Paper‑inspired algorithm:
+    • Per‑slice encoder:   EfficientNet‑B0 pre‑trained on ImageNet.
+    • Spatial Attention:   learnable soft attention over spatial locations.
+    • Temporal Core:       TLSTM (Temporal‑aware LSTM) that ingests the attentional
+      feature map for each slice and outputs a sequence of hidden states.
+    • Generator  G:        3‑D deconvolutional network turning the hidden‑state
+      sequence into a dense 3‑D volume.
+    • Discriminator D:     3‑D CNN evaluating realism of reconstructed volumes.
+    • Loss:                MAE + λ_adv · adversarial.
+
+The training loop exactly follows *Algorithm 2* provided by the user.
+
+Author: ChatGPT‑o3 (Python Assistant) – 2025‑07‑19
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+from pathlib import Path
+from typing import List, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
+from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
+
+# --------------------------------------------------------------------------------------
+# 1. DATASET ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
+
+class VolumeDataset(Dataset):
+    """Load sequences of 2‑D tumor‑detected slices **and** ground‑truth 3‑D volumes.
+
+    Expected directory structure:
+        dataset_root/
+            ├── seq_000/
+            │     ├── slices/
+            │     │     ├── 000.png  (tumor‑detected slice – bounding‑box already drawn)
+            │     │     ├── 001.png
+            │     │     └── ...
+            │     └── volume.npz   (gt_volume: ndarray float32, shape [D,H,W])
+            ├── seq_001/ ...
+            └── ...
+
+    *Each* sequence folder must contain exactly N slices; the same N across the
+    dataset simplifies batching.
+    """
+
+    def __init__(
+        self,
+        root: str | Path,
+        seq_len: int,
+        transform: transforms.Compose | None = None,
+    ) -> None:
+        self.root = Path(root)
+        self.seq_len = seq_len
+        self.transform = transform
+
+        # Gather sequence folders lazily
+        self.seq_dirs: List[Path] = [p for p in self.root.iterdir() if p.is_dir()]
+        self.seq_dirs.sort()
+
+    def __len__(self) -> int:
+        return len(self.seq_dirs)
+
+    def _load_volume(self, vol_path: Path) -> torch.Tensor:
+        data = np.load(vol_path)
+        if "volume" in data:
+            vol = data["volume"].astype(np.float32)
+        else:  # fallback to first array
+            vol = data[list(data.files)[0]].astype(np.float32)
+        # Normalise to [-1,1]
+        vol = (vol - vol.min()) / (vol.max() - vol.min() + 1e-5)
+        vol = vol * 2.0 - 1.0
+        return torch.from_numpy(vol)[None]  # [1,D,H,W]
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        seq_dir = self.seq_dirs[idx]
+        slice_dir = seq_dir / "slices"
+        vol_path = seq_dir / "volume.npz"
+
+        slice_paths = sorted(slice_dir.glob("*.png"))
+        assert (
+            len(slice_paths) == self.seq_len
+        ), f"Sequence {seq_dir.name}: expected {self.seq_len} slices, found {len(slice_paths)}"
+
+        slices: List[torch.Tensor] = []
+        for p in slice_paths:
+            img = transforms.functional.pil_to_tensor(transforms.functional.pil_from_binary(p.read_bytes()))
+            img = img.float() / 255.0  # [C,H,W] in [0,1]
+            if self.transform:
+                img = self.transform(img)
+            slices.append(img)
+
+        seq = torch.stack(slices, dim=0)  # [N,C,H,W]
+        volume = self._load_volume(vol_path)  # [1,D,H,W]
+        return seq, volume
+
+
+# --------------------------------------------------------------------------------------
+# 2. MODEL COMPONENTS ------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
+
+class SpatialAttention(nn.Module):
+    """Simple 1×1 conv attention ⇒ softmax over spatial dims."""
+
+    def __init__(self, in_channels: int):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, 1, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B,C,H,W]
+        attn = self.conv(x)  # [B,1,H,W]
+        attn = attn.flatten(2)  # [B,1,H*W]
+        attn = torch.softmax(attn, dim=-1)
+        attn = attn.view(x.size(0), 1, *x.shape[2:])
+        return x * attn  # element‑wise multiply, broadcast over C
+
+
+class TLSTM(nn.Module):
+    """Temporal LSTM unrolled over *sequence* dimension.
+
+    In practice, this is identical to nn.LSTM but we keep explicit cell state
+    for clarity with the pseudocode.
+    """
+
+    def __init__(self, in_dim: int, hidden_dim: int, num_layers: int = 1):
+        super().__init__()
+        self.lstm = nn.LSTM(in_dim, hidden_dim, num_layers=num_layers, batch_first=True)
+
+    def forward(self, x: torch.Tensor, hc: Tuple[torch.Tensor, torch.Tensor] | None = None):
+        # x: [B,N,F] where N=len(seq), F=in_dim
+        return self.lstm(x, hc)  # output [B,N,H]
+
+
+class Generator3D(nn.Module):
+    """Decode sequence of hidden states → 3‑D volume (probability mask)."""
+
+    def __init__(self, hidden_dim: int, seq_len: int, vol_depth: int):
+        super().__init__()
+        # stack hidden states as channels then use 3‑D convtranspose
+        self.seq_len = seq_len
+        self.vol_depth = vol_depth
+
+        self.proj = nn.Linear(hidden_dim, hidden_dim)
+        self.deconv = nn.Sequential(
+            nn.ConvTranspose3d(seq_len, 64, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.BatchNorm3d(64),
+            nn.ReLU(True),
+            nn.ConvTranspose3d(64, 32, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.BatchNorm3d(32),
+            nn.ReLU(True),
+            nn.Conv3d(32, 1, kernel_size=3, padding=1),
+            nn.Tanh(),  # output in [-1,1]
+        )
+
+    def forward(self, hs: torch.Tensor) -> torch.Tensor:
+        # hs: [B,N,H] — project + reshape to [B,N,H,1,1] then repeat to match depth
+        B, N, H = hs.shape
+        hs = self.proj(hs)  # linear
+        hs = hs.view(B, N, H, 1, 1)  # treat N as channels
+        vol = self.deconv(hs)  # [B,1,D,H,W] where D ≈ vol_depth
+        return vol
+
+
+class Discriminator3D(nn.Module):
+    """Simple 3‑D CNN returning scalar realism score."""
+
+    def __init__(self):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Conv3d(1, 32, 4, 2, 1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv3d(32, 64, 4, 2, 1),
+            nn.BatchNorm3d(64),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv3d(64, 128, 4, 2, 1),
+            nn.BatchNorm3d(128),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.AdaptiveAvgPool3d(1),
+            nn.Flatten(),
+            nn.Linear(128, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.model(x)
+
+
+# --------------------------------------------------------------------------------------
+# 3. TRAINER ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
+
+class VolumeReconstructionTrainer:
+    """Trainer implementing Algorithm 2."""
+
+    def __init__(
+        self,
+        dataset: VolumeDataset,
+        seq_len: int,
+        vol_depth: int,
+        batch_size: int = 2,
+        lr: float = 1e-4,
+        epochs: int = 100,
+        lambda_adv: float = 0.1,
+        device: str | torch.device = "cuda" if torch.cuda.is_available() else "cpu",
+    ) -> None:
+        self.dataset = dataset
+        self.dl = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+        self.seq_len = seq_len
+        self.vol_depth = vol_depth
+        self.epochs = epochs
+        self.device = device
+        self.lambda_adv = lambda_adv
+
+        # Encoder (EfficientNet – frozen except first/last conv for fine‑tuning optional)
+        eff = efficientnet_b0(weights=EfficientNet_B0_Weights.IMAGENET1K_V1)
+        self.encoder = eff.features  # output C=1280, stride 32
+        for p in self.encoder.parameters():
+            p.requires_grad = False
+        self.enc_out_channels = 1280
+
+        # Attention, TLSTM, Generator, Discriminator
+        self.attn = SpatialAttention(self.enc_out_channels)
+        self.tlstm = TLSTM(in_dim=self.enc_out_channels, hidden_dim=512)
+        self.generator = Generator3D(hidden_dim=512, seq_len=seq_len, vol_depth=vol_depth)
+        self.discriminator = Discriminator3D()
+
+        self.encoder.to(device)
+        self.attn.to(device)
+        self.tlstm.to(device)
+        self.generator.to(device)
+        self.discriminator.to(device)
+
+        # Optimisers (encoder frozen) – separate so we can toggle later
+        self.opt_g = torch.optim.Adam(
+            list(self.attn.parameters())
+            + list(self.tlstm.parameters())
+            + list(self.generator.parameters()),
+            lr=lr,
+        )
+        self.opt_d = torch.optim.Adam(self.discriminator.parameters(), lr=lr)
+
+        self.l1 = nn.L1Loss()
+        self.bce = nn.BCEWithLogitsLoss()
+
+    # --------------------------------------------
+    # Forward helpers
+    # --------------------------------------------
+
+    def _encode_slice(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B,C,H,W] in [0,1]
+        feats = self.encoder(x)  # [B,C',H',W']
+        feats = self.attn(feats)  # attention weighted
+        # global average pool to vector
+        feats = F.adaptive_avg_pool2d(feats, 1).squeeze(-1).squeeze(-1)  # [B,C']
+        return feats
+
+    def _process_sequence(self, seq: torch.Tensor) -> torch.Tensor:
+        # seq: [B,N,C,H,W]
+        B, N, C, H, W = seq.shape
+        x = seq.view(B * N, C, H, W)
+        feats = self._encode_slice(x)  # [B*N,C']
+        feats = feats.view(B, N, -1)  # [B,N,F]
+        out, _ = self.tlstm(feats)  # [B,N,H]
+        return out
+
+    # --------------------------------------------
+    # Training steps
+    # --------------------------------------------
+
+    def _train_discriminator(self, real_vol: torch.Tensor, fake_vol: torch.Tensor):
+        self.discriminator.zero_grad()
+        real_logits = self.discriminator(real_vol)
+        fake_logits = self.discriminator(fake_vol.detach())
+        real_labels = torch.ones_like(real_logits)
+        fake_labels = torch.zeros_like(fake_logits)
+        loss_d = self.bce(real_logits, real_labels) + self.bce(fake_logits, fake_labels)
+        loss_d.backward()
+        self.opt_d.step()
+        return loss_d.item()
+
+    def _train_generator(self, fake_vol: torch.Tensor, real_vol: torch.Tensor):
+        self.opt_g.zero_grad()
+        logits_fake = self.discriminator(fake_vol)
+        labels_real = torch.ones_like(logits_fake)
+        adv_loss = self.bce(logits_fake, labels_real)
+        recon_loss = self.l1(fake_vol, real_vol)
+        loss_g = recon_loss + self.lambda_adv * adv_loss
+        loss_g.backward()
+        self.opt_g.step()
+        return recon_loss.item(), adv_loss.item(), loss_g.item()
+
+    # --------------------------------------------
+    # Main loop
+    # --------------------------------------------
+
+    def fit(self):
+        for epoch in range(1, self.epochs + 1):
+            loss_d_acc, recon_acc, adv_acc, loss_g_acc = 0.0, 0.0, 0.0, 0.0
+            for seq, vol in self.dl:
+                seq = seq.to(self.device)  # [B,N,C,H,W]
+                vol = vol.to(self.device)  # [B,1,D,H,W]
+
+                # Forward pass through TLSTM → Generator
+                hs = self._process_sequence(seq)
+                fake_vol = self.generator(hs)
+
+                # Train D
+                loss_d = self._train_discriminator(real_vol=vol, fake_vol=fake_vol)
+
+                # Train G (reconstruction + adversarial)
+                recon_loss, adv_loss, loss_g = self._train_generator(fake_vol, vol)
+
+                loss_d_acc += loss_d
+                recon_acc += recon_loss
+                adv_acc += adv_loss
+                loss_g_acc += loss_g
+
+            n_batches = len(self.dl)
+            print(
+                f"[Epoch {epoch}/{self.epochs}] "
+                f"D: {loss_d_acc/n_batches:.4f} | "
+                f"G: {loss_g_acc/n_batches:.4f} (recon {recon_acc/n_batches:.4f}, adv {adv_acc/n_batches:.4f})"
+            )
+
+    # --------------------------------------------
+    # Inference helper
+    # --------------------------------------------
+
+    def reconstruct(self, seq: torch.Tensor) -> torch.Tensor:
+        self.encoder.eval()
+        self.attn.eval()
+        self.tlstm.eval()
+        self.generator.eval()
+        with torch.no_grad():
+            hs = self._process_sequence(seq.to(self.device))
+            vol = self.generator(hs)
+        return vol.cpu()
+
+
+# --------------------------------------------------------------------------------------
+# 4. CLI -------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
+
+def parse_args():
+    ap = argparse.ArgumentParser(description="TLSTM‑based 3‑D tumor reconstruction trainer")
+    ap.add_argument("--data-dir", required=True, help="Path to dataset root with sequences")
+    ap.add_argument("--seq-len", type=int, default=16, help="Number of slices per sequence")
+    ap.add_argument("--vol-depth", type=int, default=32, help="Depth of reconstructed volume")
+    ap.add_argument("--batch-size", type=int, default=2)
+    ap.add_argument("--epochs", type=int, default=100)
+    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--lambda-adv", type=float, default=0.1)
+    ap.add_argument("--device", default="cuda")
+    return ap.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    tf = transforms.Compose(
+        [
+            transforms.Resize((256, 256), antialias=True),
+        ]
+    )
+    ds = VolumeDataset(args.data_dir, seq_len=args.seq_len, transform=tf)
+
+    trainer = VolumeReconstructionTrainer(
+        ds,
+        seq_len=args.seq_len,
+        vol_depth=args.vol_depth,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        epochs=args.epochs,
+        lambda_adv=args.lambda_adv,
+        device=args.device,
+    )
+    trainer.fit()
+
+
+if __name__ == "__main__":
+    main()
