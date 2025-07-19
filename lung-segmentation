@@ -1,0 +1,439 @@
+# lung_segmentation_gan_ppo.py
+"""Lung Segmentation using a GAN with Off‑Policy PPO
+
+This script implements a full training pipeline for pixel‑wise lung segmentation
+on 2‑D or 3‑D CT data.  Architecture:
+    • Generator – U‑Net producing a probability mask.
+    • Discriminator – CNN with dilated convolutions judging realism of masks.
+    • Value Network – estimates state value for PPO.
+    • Off‑Policy PPO Trainer – optimises the generator via the clipped surrogate
+      objective + adversarial loss as specified in Algorithm 1 of the paper.
+
+Key Classes
+-----------
+LungDataset              – loads images & masks from *any* folder structure.
+preprocess_volume        – intensity normalisation, resampling, cropping.
+GeneratorUNet            – U‑Net backbone (2‑D or 3‑D switchable).
+DilatedDiscriminator     – discriminator with progressive dilation.
+ValueNetwork             – small CNN predicting V(s).
+ReplayBuffer             – stores transitions for off‑policy learning.
+OffPolicyPPOTrainer      – core optimisation loop.
+
+Usage (minimal)
+---------------
+$ python lung_segmentation_gan_ppo.py \
+        --data_root /path/to/LIDC-IDRI \
+        --epochs 200 \
+        --batch_size 4
+
+All hyper‑parameters are exposed via CLI flags.
+
+Notes
+-----
+* The code is research‑grade: for production you should add rigorous error
+  handling, logging and experiment tracking.
+* 3‑D support can be enabled by setting --dim 3.  Everything then switches to
+  3‑D convolutions automatically.
+* This script *does not* assume a specific file format; loaders for DICOM,
+  NIfTI, or NumPy are provided – pick one via --loader.
+* Requires PyTorch ≥1.13, torchvision, numpy, scikit‑image, nibabel (optional),
+  tqdm.
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import random
+from collections import deque
+from pathlib import Path
+from typing import Deque, List, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
+from tqdm import tqdm
+
+# 1 ─────────────────────────────────────────────────────────────────────────────
+# Data IO & preprocessing
+# ───────────────────────────────────────────────────────────────────────────────
+
+
+def window_intensity(vol: np.ndarray, wl: int = -600, ww: int = 1500) -> np.ndarray:
+    """Window/level normalisation typical for lung CT."""
+    lower, upper = wl - ww // 2, wl + ww // 2
+    vol = np.clip(vol, lower, upper)
+    vol = (vol - lower) / float(upper - lower)
+    return vol.astype(np.float32)
+
+
+class LungDataset(Dataset):
+    """Generic dataset that discovers *img* & *mask* files inside `data_root`.
+
+    Folder layout (flexible):
+        data_root/
+           ├── case‑001/
+           │   ├── img.npz | img.nii.gz | *.dcm
+           │   └── mask.npz | mask.nii.gz | *.png
+           └── case‑002/ …
+
+    The loader is chosen via `loader` flag: {npz, nifti, dicom}.
+    """
+
+    def __init__(self, data_root: str | Path, loader: str = "npz", dim: int = 3):
+        super().__init__()
+        self.data_root = Path(data_root)
+        self.loader = loader.lower()
+        self.dim = dim
+        self.cases = sorted([p for p in self.data_root.iterdir() if p.is_dir()])
+        assert self.cases, f"No cases found in {data_root}".
+
+    # Loader helpers ---------------------------------------------------------
+    def _load_npz(self, f: Path) -> np.ndarray:
+        return np.load(f)["arr_0"].astype(np.float32)
+
+    def _load_nifti(self, f: Path) -> np.ndarray:
+        import nibabel as nib
+        return np.asarray(nib.load(str(f)).dataobj, dtype=np.float32)
+
+    def _load_dicom(self, folder: Path) -> np.ndarray:
+        import pydicom as pyd
+        from skimage.transform import resize
+        slices = sorted(folder.glob("*.dcm"), key=lambda x: float(pyd.dcmread(x).SliceLocation))
+        vols = [pyd.dcmread(s).pixel_array.astype(np.float32) for s in slices]
+        vol = np.stack(vols)
+        return vol
+
+    def _load_case(self, case_dir: Path) -> Tuple[np.ndarray, np.ndarray]:
+        img_path = next(case_dir.glob("img.*"), None) or next(case_dir.glob("*.dcm"), None)
+        mask_path = next(case_dir.glob("mask.*"), None)
+        assert img_path and mask_path, f"Missing img/mask in {case_dir}"
+        # choose loader
+        if self.loader == "npz":
+            img = self._load_npz(img_path)
+            mask = self._load_npz(mask_path)
+        elif self.loader == "nifti":
+            img = self._load_nifti(img_path)
+            mask = self._load_nifti(mask_path)
+        elif self.loader == "dicom":
+            img = self._load_dicom(img_path.parent)
+            mask = self._load_npz(mask_path)  # assume mask npz even with DICOM imgs
+        else:
+            raise ValueError(f"Unknown loader {self.loader}")
+        return img, mask
+
+    def __len__(self) -> int:
+        return len(self.cases)
+
+    def __getitem__(self, idx: int):
+        img, mask = self._load_case(self.cases[idx])
+        img = window_intensity(img)
+        img = torch.from_numpy(img).unsqueeze(0)  # (1, D, H, W) or (1, H, W)
+        mask = torch.from_numpy(mask).unsqueeze(0)
+        if self.dim == 2:
+            # sample a random slice at runtime
+            z = torch.randint(low=0, high=img.shape[1], size=())
+            img = img[:, z]
+            mask = mask[:, z]
+        return img, mask
+
+
+# 2 ─────────────────────────────────────────────────────────────────────────────
+# Network blocks
+# ───────────────────────────────────────────────────────────────────────────────
+
+
+def _conv_block(cin: int, cout: int, dim: int = 2) -> nn.Module:
+    Conv = nn.Conv3d if dim == 3 else nn.Conv2d
+    Norm = nn.InstanceNorm3d if dim == 3 else nn.InstanceNorm2d
+    return nn.Sequential(
+        Conv(cin, cout, kernel_size=3, padding=1, bias=False),
+        Norm(cout),
+        nn.LeakyReLU(inplace=True),
+        Conv(cout, cout, kernel_size=3, padding=1, bias=False),
+        Norm(cout),
+        nn.LeakyReLU(inplace=True),
+    )
+
+
+def _up_block(cin: int, cout: int, dim: int = 2) -> nn.Module:
+    ConvTrans = nn.ConvTranspose3d if dim == 3 else nn.ConvTranspose2d
+    return nn.Sequential(ConvTrans(cin, cout, kernel_size=2, stride=2, bias=False))
+
+
+class GeneratorUNet(nn.Module):
+    """U‑Net generator that returns logits (no Sigmoid)."""
+
+    def __init__(self, in_channels: int = 1, base: int = 32, dim: int = 2):
+        super().__init__()
+        self.dim = dim
+        Pool = nn.MaxPool3d if dim == 3 else nn.MaxPool2d
+        self.enc1 = _conv_block(in_channels, base, dim)
+        self.enc2 = _conv_block(base, base * 2, dim)
+        self.enc3 = _conv_block(base * 2, base * 4, dim)
+        self.enc4 = _conv_block(base * 4, base * 8, dim)
+        self.bottleneck = _conv_block(base * 8, base * 16, dim)
+
+        self.up4 = _up_block(base * 16, base * 8, dim)
+        self.dec4 = _conv_block(base * 16, base * 8, dim)
+        self.up3 = _up_block(base * 8, base * 4, dim)
+        self.dec3 = _conv_block(base * 8, base * 4, dim)
+        self.up2 = _up_block(base * 4, base * 2, dim)
+        self.dec2 = _conv_block(base * 4, base * 2, dim)
+        self.up1 = _up_block(base * 2, base, dim)
+        self.dec1 = _conv_block(base * 2, base, dim)
+
+        Conv = nn.Conv3d if dim == 3 else nn.Conv2d
+        self.out_conv = Conv(base, 1, kernel_size=1)
+        self.pool = Pool(kernel_size=2, stride=2)
+
+    def forward(self, x):
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+        e4 = self.enc4(self.pool(e3))
+        b = self.bottleneck(self.pool(e4))
+
+        d4 = self.dec4(torch.cat([self.up4(b), e4], dim=1))
+        d3 = self.dec3(torch.cat([self.up3(d4), e3], dim=1))
+        d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1))
+        d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
+        return self.out_conv(d1)
+
+
+class DilatedDiscriminator(nn.Module):
+    """Patch discriminator with dilated convolutions."""
+
+    def __init__(self, in_channels: int = 2, base: int = 32, dim: int = 2):
+        super().__init__()
+        Conv = nn.Conv3d if dim == 3 else nn.Conv2d
+        Norm = nn.InstanceNorm3d if dim == 3 else nn.InstanceNorm2d
+        layers: List[nn.Module] = []
+        dilation = 1
+        channels = in_channels
+        for _ in range(4):
+            layers += [
+                Conv(channels, base, kernel_size=3, padding=dilation, dilation=dilation, bias=False),
+                Norm(base), nn.LeakyReLU(0.2, inplace=True)
+            ]
+            channels = base
+            base *= 2
+            dilation *= 2
+        layers.append(Conv(channels, 1, kernel_size=3, padding=1))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, img, mask):
+        # concatenate along channel axis
+        x = torch.cat([img, mask], dim=1)
+        return self.net(x).mean(dim=list(range(2, x.ndim)))  # global average pooling
+
+
+class ValueNetwork(nn.Module):
+    """Simple CNN estimating V(s) for PPO."""
+
+    def __init__(self, in_channels: int = 2, base: int = 32, dim: int = 2):
+        super().__init__()
+        Conv = nn.Conv3d if dim == 3 else nn.Conv2d
+        Norm = nn.InstanceNorm3d if dim == 3 else nn.InstanceNorm2d
+        self.feature = nn.Sequential(
+            Conv(in_channels, base, 3, padding=1), Norm(base), nn.ReLU(inplace=True),
+            Conv(base, base * 2, 3, padding=1), Norm(base * 2), nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool3d(1) if dim == 3 else nn.AdaptiveAvgPool2d(1),
+        )
+        self.head = nn.Linear(base * 2, 1)
+
+    def forward(self, img, mask):
+        x = torch.cat([img, mask], dim=1)
+        x = self.feature(x)
+        x = x.view(x.size(0), -1)
+        return self.head(x)
+
+
+# 3 ─────────────────────────────────────────────────────────────────────────────
+# Off‑Policy PPO Components
+# ───────────────────────────────────────────────────────────────────────────────
+
+
+action_space = 2  # lung / non‑lung
+
+
+def compute_reward(pred: torch.Tensor, target: torch.Tensor, epsilon: float = 0.25):
+    """Implements asymmetric reward from Eq. 18.
+    +1  for minority correct, −1 for minority wrong, ±ε for majority."""
+    with torch.no_grad():
+        minority = target == 1
+        majority = ~minority
+        correct = (pred == target)
+        reward = torch.zeros_like(target, dtype=torch.float32)
+        reward[minority & correct] = 1.0
+        reward[minority & ~correct] = -1.0
+        reward[majority & correct] = epsilon
+        reward[majority & ~correct] = -epsilon
+    return reward
+
+
+class Transition(Tuple):
+    state: torch.Tensor
+    action: torch.Tensor
+    reward: torch.Tensor
+    next_state: torch.Tensor
+    log_prob: torch.Tensor
+
+
+class ReplayBuffer:
+    def __init__(self, capacity: int = 5000):
+        self.capacity = capacity
+        self.buffer: Deque[Transition] = deque(maxlen=capacity)
+
+    def push(self, *transition):
+        self.buffer.append(transition)
+
+    def sample(self, batch_size: int):
+        indices = random.sample(range(len(self.buffer)), batch_size)
+        return [self.buffer[i] for i in indices]
+
+    def __len__(self):
+        return len(self.buffer)
+
+
+class OffPolicyPPOTrainer:
+    def __init__(
+        self,
+        generator: GeneratorUNet,
+        discriminator: DilatedDiscriminator,
+        valuer: ValueNetwork,
+        *,
+        gamma: float = 0.99,
+        clip_eps: float = 0.2,
+        adv_loss_w: float = 1.0,
+        lr: float = 3e-4,
+        device: str | torch.device = "cuda",
+    ):
+        self.g = generator.to(device)
+        self.d = discriminator.to(device)
+        self.v = valuer.to(device)
+        self.optimizer_g = optim.Adam(self.g.parameters(), lr=lr)
+        self.optimizer_d = optim.Adam(self.d.parameters(), lr=lr)
+        self.optimizer_v = optim.Adam(self.v.parameters(), lr=lr)
+        self.buffer = ReplayBuffer()
+        self.gamma = gamma
+        self.clip_eps = clip_eps
+        self.adv_loss_w = adv_loss_w
+        self.device = device
+        self.bce_loss = nn.BCEWithLogitsLoss()
+
+    def select_action(self, img):
+        logits = self.g(img)
+        probs = torch.sigmoid(logits)
+        # Bernoulli per‑pixel
+        dist = torch.distributions.Bernoulli(probs)
+        action = dist.sample()
+        log_prob = dist.log_prob(action)
+        return action, log_prob, logits
+
+    def compute_advantage(self, rewards, values, next_values):
+        return rewards + self.gamma * next_values - values
+
+    def update(self, batch_size: int = 4, ppo_epochs: int = 4):
+        if len(self.buffer) < batch_size:
+            return
+        for _ in range(ppo_epochs):
+            transitions = self.buffer.sample(batch_size)
+            batch = list(zip(*transitions))
+            states, actions, rewards, next_states, old_logps = [torch.stack(x).to(self.device) for x in batch]
+            # value targets
+            values = self.v(*states).squeeze(-1)
+            next_values = self.v(*next_states).squeeze(-1)
+            advantages = self.compute_advantage(rewards.mean(dim=[2, 3]), values, next_values).detach()
+
+            # generator forward
+            logits = self.g(states[0])  # states[0] is img
+            probs = torch.sigmoid(logits)
+            dist = torch.distributions.Bernoulli(probs)
+            new_logps = dist.log_prob(actions)
+
+            ratio = torch.exp(new_logps - old_logps)
+            surr1 = ratio * advantages.unsqueeze(-1).unsqueeze(-1)
+            surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * advantages.unsqueeze(-1).unsqueeze(-1)
+            ppo_loss = -torch.min(surr1, surr2).mean()
+
+            # adversarial loss
+            fake_pred = self.d(states[0], actions)
+            adv_loss = self.bce_loss(fake_pred, torch.ones_like(fake_pred))
+
+            g_loss = ppo_loss + self.adv_loss_w * adv_loss
+            self.optimizer_g.zero_grad(); g_loss.backward(); self.optimizer_g.step()
+
+            # update discriminator
+            real_pred = self.d(states[0], states[1])  # states[1] is ground mask here
+            fake_pred_detach = self.d(states[0], actions.detach())
+            d_loss = self.bce_loss(real_pred, torch.ones_like(real_pred)) + \
+                     self.bce_loss(fake_pred_detach, torch.zeros_like(fake_pred_detach))
+            self.optimizer_d.zero_grad(); d_loss.backward(); self.optimizer_d.step()
+
+            # value loss
+            v_target = rewards.mean(dim=[2, 3]) + self.gamma * next_values
+            v_loss = F.mse_loss(values, v_target.detach())
+            self.optimizer_v.zero_grad(); v_loss.backward(); self.optimizer_v.step()
+        # clear buffer after update
+        self.buffer.buffer.clear()
+
+    def train_epoch(self, loader: DataLoader):
+        self.g.train(); self.d.train(); self.v.train()
+        for img, mask in tqdm(loader, desc="train", leave=False):
+            img, mask = img.to(self.device), mask.to(self.device)
+            action, logp, _ = self.select_action(img)
+            reward = compute_reward(action, mask)
+            # store transition (state, action, reward, next_state, logp)
+            self.buffer.push((img, mask), action, reward, (img, mask), logp)
+            self.update()
+
+
+# 4 ─────────────────────────────────────────────────────────────────────────────
+# Utility – CLI
+# ───────────────────────────────────────────────────────────────────────────────
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--data_root", type=str, required=True)
+    p.add_argument("--epochs", type=int, default=50)
+    p.add_argument("--batch_size", type=int, default=2)
+    p.add_argument("--dim", type=int, choices=[2, 3], default=2)
+    p.add_argument("--loader", type=str, choices=["npz", "nifti", "dicom"], default="npz")
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    return p.parse_args()
+
+
+# 5 ─────────────────────────────────────────────────────────────────────────────
+# main
+# ───────────────────────────────────────────────────────────────────────────────
+
+
+def main():
+    args = parse_args()
+    ds = LungDataset(args.data_root, loader=args.loader, dim=args.dim)
+    dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+
+    g = GeneratorUNet(dim=args.dim)
+    d = DilatedDiscriminator(dim=args.dim)
+    v = ValueNetwork(dim=args.dim)
+
+    trainer = OffPolicyPPOTrainer(
+        g, d, v, lr=args.lr, device=args.device, adv_loss_w=1.0,
+    )
+
+    for epoch in range(1, args.epochs + 1):
+        trainer.train_epoch(dl)
+        print(f"[Epoch {epoch}/{args.epochs}] completed.")
+        # TODO: add validation & checkpointing
+
+
+if __name__ == "__main__":
+    main()
