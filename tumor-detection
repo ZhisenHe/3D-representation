@@ -1,0 +1,277 @@
+# tumor_detection_mask_rcnn_adv.py
+"""Tumor Detection in Lung CT using Mask‑R‑CNN with Adversarial Bounding‑Box Loss
+
+This module implements the second stage of the pipeline that follows lung
+segmentation. The generator is a Mask‑R‑CNN that consumes the cropped lung
+volumes from Stage‑1 and predicts:
+    • class logits (tumor / background)
+    • bounding boxes for each RoI
+    • instance masks (optional)
+
+A discriminator operating on RoI feature maps enforces realism via an
+adversarial loss (Eq. 30) and is trained alternately with the generator using
+Eq. 31.  The total generator loss is given by Eq. 29:
+    L_G = L_cls + L_box + L_adv^(G_b)
+
+The module is organised as follows
+==================================
+
+1.  Data loading utilities
+2.  Generator (Mask‑R‑CNN) factory
+3.  Dilated‑CNN Discriminator
+4.  Loss functions + EMD stub
+5.  `TumorDetectionTrainer` class with alternate optimisation of G and D
+6.  CLI entry‑point and hyper‑parameter parsing
+"""
+
+from __future__ import annotations
+import argparse
+from pathlib import Path
+from typing import List, Tuple, Dict
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from torchvision.models.detection import maskrcnn_resnet50_fpn
+from torchvision.ops import boxes as box_ops
+
+# --------------------------------------------------------------------------------------
+# 1. Dataset
+# --------------------------------------------------------------------------------------
+class TumorDataset(Dataset):
+    """Loads **segmented** lung volumes and tumour annotations.
+
+    Expected directory layout::
+        root/
+            case_0001/
+                lung.nii.gz           # 3‑D mask from Stage‑1 or per‑slice PNGs
+                ct.nii.gz             # original CT (or PNG stack)
+                boxes.npy             # (N, 6) 3‑D boxes or (N, 4) 2‑D per slice
+                labels.npy            # (N,)  class ids (1=tumour)
+
+    For simplicity the loader supports 2‑D slices as well (set `slice_mode=True`).
+    """
+
+    def __init__(self,
+                 root: str | Path,
+                 slice_mode: bool = True,
+                 transforms_: transforms.Compose | None = None):
+        self.root = Path(root)
+        self.slice_mode = slice_mode
+        self.transforms = transforms_ or transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5], std=[0.25]),
+        ])
+
+        self.samples: List[Tuple[Path, Path, Path, Path]] = []
+        for case in sorted(self.root.iterdir()):
+            if not case.is_dir():
+                continue
+            ct_file = next(case.glob("ct.*"))
+            lung_file = next(case.glob("lung.*"))
+            boxes_file = case / "boxes.npy"
+            labels_file = case / "labels.npy"
+            self.samples.append((ct_file, lung_file, boxes_file, labels_file))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        ct_path, lung_path, boxes_path, labels_path = self.samples[idx]
+
+        # --- load volume or slice ---
+        # NOTE: For brevity we assume npy format per slice; replace with nibabel for NIfTI.
+        import numpy as np
+        ct = np.load(ct_path)
+        lung_mask = np.load(lung_path)
+        boxes = np.load(boxes_path)  # (N, 4)
+        labels = np.load(labels_path)  # (N,)
+
+        # Focus on lung region only
+        ct = ct * lung_mask  # zero‑out non‑lung pixels
+
+        # Apply transforms
+        img = self.transforms(ct)  # (1, H, W)
+
+        # Build target dict as expected by Mask R‑CNN
+        target: Dict[str, torch.Tensor] = {
+            "boxes": torch.as_tensor(boxes, dtype=torch.float32),
+            "labels": torch.as_tensor(labels, dtype=torch.int64),
+        }
+        return img, target
+
+# --------------------------------------------------------------------------------------
+# 2. Generator
+# --------------------------------------------------------------------------------------
+
+def build_generator(num_classes: int = 2, pretrained_backbone: bool = True):
+    """Creates a Mask‑R‑CNN with configurable class count (incl. background)."""
+    model = maskrcnn_resnet50_fpn(pretrained=pretrained_backbone)
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+    model.roi_heads.box_predictor = nn.Sequential(
+        nn.Linear(in_features, in_features),
+        nn.ReLU(inplace=True),
+        nn.Linear(in_features, num_classes)  # cls logits
+    )
+    # bounding box regressor is kept unchanged (predicts 4 coords per class)
+    return model
+
+# --------------------------------------------------------------------------------------
+# 3. Discriminator
+# --------------------------------------------------------------------------------------
+class RoIDiscriminator(nn.Module):
+    """Dilated‑CNN discriminator operating on RoI feature maps (C×H×W)."""
+
+    def __init__(self, in_channels: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, 128, kernel_size=3, padding=2, dilation=2),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(128, 64, kernel_size=3, padding=4, dilation=4),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.AdaptiveAvgPool2d(1),  # output (B, 64, 1, 1)
+            nn.Flatten(),
+            nn.Linear(64, 1),
+            nn.Sigmoid(),  # probability real/fake
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+# --------------------------------------------------------------------------------------
+# 4. Loss functions
+# --------------------------------------------------------------------------------------
+class AdversarialLoss:
+    """Implements Eq. 30 and Eq. 31 for generator & discriminator."""
+
+    def __init__(self, device: torch.device):
+        self.bce = nn.BCELoss()
+        self.device = device
+
+    def generator_loss(self, d_out_fake: torch.Tensor):
+        # Eq. 30: −log D(G(RoI)) averaged over mini‑batch
+        y_real = torch.ones_like(d_out_fake, device=self.device)
+        return self.bce(d_out_fake, y_real)
+
+    def discriminator_loss(self,
+                           d_out_real: torch.Tensor,
+                           d_out_fake: torch.Tensor):
+        # Eq. 31: − [log D(real) + log(1 − D(fake))]
+        y_real = torch.ones_like(d_out_real, device=self.device)
+        y_fake = torch.zeros_like(d_out_fake, device=self.device)
+        loss_real = self.bce(d_out_real, y_real)
+        loss_fake = self.bce(d_out_fake, y_fake)
+        return (loss_real + loss_fake) * 0.5
+
+# Stub for Earth Mover’s Distance (optional)
+try:
+    import geomloss  # type: ignore
+    def earth_movers_distance(p: torch.Tensor, q: torch.Tensor):
+        return geomloss.SamplesLoss()(p, q)
+except ImportError:  # pragma: no cover
+    def earth_movers_distance(p: torch.Tensor, q: torch.Tensor):
+        return torch.tensor(0., device=p.device)
+
+# --------------------------------------------------------------------------------------
+# 5. Trainer
+# --------------------------------------------------------------------------------------
+class TumorDetectionTrainer:
+
+    def __init__(self,
+                 data_dir: str | Path,
+                 batch_size: int = 4,
+                 num_epochs: int = 50,
+                 lr: float = 1e‑4,
+                 lambda_adv: float = 0.1,
+                 device: str = "cuda"):
+        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+        self.dataset = TumorDataset(data_dir)
+        self.loader = DataLoader(self.dataset, batch_size=batch_size, shuffle=True,
+                                 collate_fn=self._collate)
+        self.gen = build_generator().to(self.device)
+        self.disc = RoIDiscriminator().to(self.device)
+
+        self.optim_G = optim.Adam(self.gen.parameters(), lr=lr)
+        self.optim_D = optim.Adam(self.disc.parameters(), lr=lr)
+        self.adv_loss = AdversarialLoss(self.device)
+        self.num_epochs = num_epochs
+        self.lambda_adv = lambda_adv
+
+    @staticmethod
+    def _collate(batch):
+        return tuple(zip(*batch))  # images, targets
+
+    # ----------------------- main training loop -----------------------
+    def fit(self):
+        for epoch in range(self.num_epochs):
+            self._train_one_epoch(epoch)
+            # (optional) validation / checkpointing here
+
+    def _train_one_epoch(self, epoch: int):
+        self.gen.train()
+        self.disc.train()
+        for imgs, targets in self.loader:
+            imgs = list(img.to(self.device) for img in imgs)
+            targets = [{k: v.to(self.device) for k, v in t.items()} for t in targets]
+
+            # -------------------- G forward --------------------
+            g_out = self.gen(imgs, targets)  # returns losses dict in training mode
+            loss_cls = g_out["loss_classifier"]
+            loss_box = g_out["loss_box_reg"]
+
+            # Extract RoI feature maps for discriminator
+            with torch.no_grad():
+                features = self.gen.backbone(imgs[0].unsqueeze(0))  # prototype feature shape
+            fmap_key = list(features.keys())[0]
+            rois_feats = features[fmap_key]  # (B, C, H, W) – simplification
+            d_out_fake = self.disc(rois_feats.detach())
+            adv_loss_G = self.adv_loss.generator_loss(d_out_fake)
+
+            # Total generator loss
+            loss_G = loss_cls + loss_box + self.lambda_adv * adv_loss_G
+
+            self.optim_G.zero_grad()
+            loss_G.backward()
+            self.optim_G.step()
+
+            # -------------------- D forward --------------------
+            # Real samples: use ground‑truth RoIs converted to feature maps (stubbed)
+            d_out_real = torch.rand_like(d_out_fake)  # TODO: encode gt boxes to fmaps
+            d_out_fake_detached = self.disc(rois_feats.detach())
+            loss_D = self.adv_loss.discriminator_loss(d_out_real, d_out_fake_detached)
+
+            self.optim_D.zero_grad()
+            loss_D.backward()
+            self.optim_D.step()
+
+            # (optional) log to console / tensorboard
+            print(f"[Epoch {epoch}] loss_G: {loss_G.item():.3f}  loss_D: {loss_D.item():.3f}")
+
+# --------------------------------------------------------------------------------------
+# 6. CLI script
+# --------------------------------------------------------------------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Tumor detection with Mask R‑CNN + adversarial loss")
+    p.add_argument("--data", required=True, help="Path to dataset root directory")
+    p.add_argument("--epochs", type=int, default=50)
+    p.add_argument("--bs", type=int, default=4, help="Batch size")
+    p.add_argument("--lr", type=float, default=1e‑4)
+    p.add_argument("--lambda_adv", type=float, default=0.1, help="Weight of adversarial loss")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    trainer = TumorDetectionTrainer(data_dir=args.data,
+                                    batch_size=args.bs,
+                                    num_epochs=args.epochs,
+                                    lr=args.lr,
+                                    lambda_adv=args.lambda_adv)
+    trainer.fit()
+
+
+if __name__ == "__main__":
+    main()
